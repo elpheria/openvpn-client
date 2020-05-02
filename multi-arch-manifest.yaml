@@ -1,18 +1,16 @@
 image: elpheria/openvpn-client:latest
+tags: ['5c8b935']
 manifests:
   - image: elpheria/openvpn-client:amd64
-    tags: ['5c8b935']
     platform:
       architecture: amd64
       os: linux
   - image: elpheria/openvpn-client:aarch64
-    tags: ['5c8b935']
     platform:
       architecture: arm64
       os: linux
       variant: v8
   - image: elpheria/openvpn-client:armhf
-    tags: ['5c8b935']
     platform:
       architecture: arm
       os: linux
