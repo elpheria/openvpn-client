@@ -47,8 +47,12 @@ firewall() { local port="${1:-1194}" docker_network="$(ip -o addr show dev eth0|
             docker6_network="$(ip -o addr show dev eth0 |
             awk '$3 == "inet6" {print $4; exit}')"
     [[ -z "${1:-}" && -r $conf ]] &&
-        port="$(awk '/^remote / && NF ~ /^[0-9]*$/ {print $NF}' $conf |
-                    grep ^ || echo 1194)"
+        port="$(awk -F"[\r\t ]+" '/^remote/ && $3~/^[0-9]+$/ {print $3}' $conf |
+                    uniq | grep ^ || echo 1194)"
+
+    test -f /proc/net/if_inet6 && { lsmod |grep -qF ip6table_filter || { \
+        echo "WARNING: ip6tables disabled!"
+        echo "Run 'sudo modprobe ip6table_filter' on your host"; };}
 
     ip6tables -F 2>/dev/null
     ip6tables -X 2>/dev/null
@@ -72,11 +76,13 @@ firewall() { local port="${1:-1194}" docker_network="$(ip -o addr show dev eth0|
     ip6tables -A OUTPUT -o tap+ -j ACCEPT 2>/dev/null
     ip6tables -A OUTPUT -o tun+ -j ACCEPT 2>/dev/null
     ip6tables -A OUTPUT -d ${docker6_network} -j ACCEPT 2>/dev/null
-    ip6tables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT 2>/dev/null
     ip6tables -A OUTPUT -p tcp -m owner --gid-owner vpn -j ACCEPT 2>/dev/null &&
     ip6tables -A OUTPUT -p udp -m owner --gid-owner vpn -j ACCEPT 2>/dev/null||{
-        ip6tables -A OUTPUT -p tcp -m tcp --dport $port -j ACCEPT 2>/dev/null
-        ip6tables -A OUTPUT -p udp -m udp --dport $port -j ACCEPT 2>/dev/null; }
+        for i in $port; do
+            ip6tables -A OUTPUT -p tcp -m tcp --dport $i -j ACCEPT 2>/dev/null
+            ip6tables -A OUTPUT -p udp -m udp --dport $i -j ACCEPT 2>/dev/null
+        done
+        ip6tables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT 2>/dev/null; }
     ip6tables -t nat -A POSTROUTING -o tap+ -j MASQUERADE
     ip6tables -t nat -A POSTROUTING -o tun+ -j MASQUERADE
     iptables -F
@@ -96,11 +102,22 @@ firewall() { local port="${1:-1194}" docker_network="$(ip -o addr show dev eth0|
     iptables -A OUTPUT -o tap+ -j ACCEPT
     iptables -A OUTPUT -o tun+ -j ACCEPT
     iptables -A OUTPUT -d ${docker_network} -j ACCEPT
-    iptables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT
     iptables -A OUTPUT -p tcp -m owner --gid-owner vpn -j ACCEPT 2>/dev/null &&
     iptables -A OUTPUT -p udp -m owner --gid-owner vpn -j ACCEPT || {
-        iptables -A OUTPUT -p tcp -m tcp --dport $port -j ACCEPT
-        iptables -A OUTPUT -p udp -m udp --dport $port -j ACCEPT; }
+        for i in $port; do
+            iptables -A OUTPUT -p tcp -m tcp --dport $i -j ACCEPT
+            iptables -A OUTPUT -p udp -m udp --dport $i -j ACCEPT
+        done
+        iptables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT; }
+    if grep -Fq "127.0.0.11" /etc/resolv.conf; then
+        iptables -A OUTPUT -d 127.0.0.11 -m owner --gid-owner vpn -j ACCEPT \
+        2>/dev/null && {
+            iptables -A OUTPUT -p udp -m udp --dport 53 -j ACCEPT
+            ext_args+=" --route-up '/bin/sh -c \""
+            ext_args+=" iptables -A OUTPUT -d 127.0.0.11 -j ACCEPT\"'"
+            ext_args+=" --route-pre-down '/bin/sh -c \""
+            ext_args+=" iptables -D OUTPUT -d 127.0.0.11 -j ACCEPT\"'"
+        } || iptables -A OUTPUT -d 127.0.0.11 -j ACCEPT; fi
     iptables -t nat -A POSTROUTING -o tap+ -j MASQUERADE
     iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE
     [[ -r $firewall_cust ]] && . $firewall_cust
@@ -109,12 +126,45 @@ firewall() { local port="${1:-1194}" docker_network="$(ip -o addr show dev eth0|
     [[ -s $route ]] && for net in $(cat $route); do return_route $net; done
 }
 
+### global_return_routes: add a route back to all networks for return traffic
+# Arguments:
+#   none)
+# Return: configured return routes
+global_return_routes() { local if=$(ip r | awk '/^default/ {print $5; quit}')
+    local gw6="$(ip -6 r show dev $if | awk '/default/ {print $3}')" \
+    gw="$(ip -4 r show dev $if | awk '/default/ {print $3}')" \
+    ip6=$(ip -6 a show dev $if | awk -F '[ \t/]+' '/inet6.*global/ {print $3}')\
+    ip=$(ip -4 a show dev $if | awk -F '[ \t/]+' '/inet .*global/ {print $3}')
+
+    for i in $ip6; do
+        ip -6 rule show table 10 | grep -q "$i\\>" ||
+            ip -6 rule add from $i lookup 10
+        ip6tables -S 2>/dev/null | grep -q "$i\\>" ||
+            ip6tables -A INPUT -d $i -j ACCEPT 2>/dev/null
+    done
+    for i in $gw6; do
+        ip -6 route show table 10 | grep -q "$i\\>" ||
+            ip -6 route add default via $i table 10
+    done
+
+    for i in $ip; do
+        ip -4 rule show table 10 | grep -q "$i\\>" ||
+            ip rule add from $i lookup 10
+        iptables -S | grep -q "$i\\>" || iptables -A INPUT -d $i -j ACCEPT
+    done
+    for i in $gw; do
+        ip -4 route show table 10 | grep -q "$i\\>" ||
+            ip route add default via $i table 10
+    done
+}
+
 ### return_route: add a route back to your network, so that return traffic works
 # Arguments:
 #   network) a CIDR specified network range
 # Return: configured return route
 return_route6() { local network="$1" gw="$(ip -6 route |
-                awk '/default/{print $3}')"
+                awk '/default/ {print $3}')"
+    echo "The use of ROUTE6 or -R may no longer be needed, try it without!!"
     ip -6 route | grep -q "$network" ||
         ip -6 route add to $network via $gw dev eth0
     ip6tables -A INPUT -s $network -j ACCEPT 2>/dev/null
@@ -129,6 +179,7 @@ return_route6() { local network="$1" gw="$(ip -6 route |
 #   network) a CIDR specified network range
 # Return: configured return route
 return_route() { local network="$1" gw="$(ip route |awk '/default/ {print $3}')"
+    echo "The use of ROUTE or -r may no longer be needed, try it without!"
     ip route | grep -q "$network" ||
         ip route add to $network via $gw dev eth0
     iptables -A INPUT -s $network -j ACCEPT
@@ -196,25 +247,9 @@ vpn() { local server="$1" user="$2" pass="$3" port="${4:-1194}" proto=${5:-udp}\
 #   protocol) optional protocol (defaults to TCP)
 # Return: configured NAT rule
 vpnportforward() { local port="$1" protocol="${2:-tcp}"
-    ip6tables -t nat -A OUTPUT -i tap+ -p $protocol --dport $port -j DNAT \
-                --to-destination ::11:$port 2>/dev/null &&
-    ip6tables -t nat -A OUTPUT -i tun+ -p $protocol --dport $port -j DNAT \
-                --to-destination ::11:$port 2>/dev/null ||
-    ip6tables -t nat -A OUTPUT -p $protocol --dport $port -j DNAT \
-                --to-destination ::11:$port 2>/dev/null
     ip6tables -A INPUT -p $protocol -m $protocol --dport $port -j ACCEPT \
                 2>/dev/null
-    ip6tables -A FORWARD -i tun0 -p $protocol -m $protocol --dport $port -j \
-                ACCEPT 2>/dev/null
-    iptables -t nat -A OUTPUT -i tap+ -p $protocol --dport $port -j DNAT \
-                --to-destination 127.0.0.11:$port 2>/dev/null &&
-    iptables -t nat -A OUTPUT -i tun+ -p $protocol --dport $port -j DNAT \
-                --to-destination 127.0.0.11:$port 2>/dev/null ||
-    iptables -t nat -A OUTPUT -p $protocol --dport $port -j DNAT \
-                --to-destination 127.0.0.11:$port
     iptables -A INPUT -p $protocol -m $protocol --dport $port -j ACCEPT
-    iptables -A FORWARD -i tun0 -p $protocol -m $protocol --dport $port -j \
-                ACCEPT
     echo "Setup forwarded port: $port $protocol"
 }
 
@@ -285,10 +320,10 @@ while getopts ":hc:Ddf:a:m:o:p:R:r:v:" opt; do
         c) CERT_AUTH="$OPTARG" ;;
         D) DEFAULT_GATEWAY="false" ;;
         d) DNS="true" ;;
-        f) FIREWALL="true" ;;
+        f) FIREWALL="$OPTARG" ;;
         m) MSS="$OPTARG" ;;
         o) OTHER_ARGS+=" $OPTARG" ;;
-        p) eval vpnportforward $(sed 's/^/"/; s/$/"/; s/;/" "/g' <<< $OPTARG) ;;
+        p) export VPNPORT$OPTIND="$OPTARG" ;;
         R) return_route6 "$OPTARG" ;;
         r) return_route "$OPTARG" ;;
         v) VPN="$OPTARG" ;;
@@ -301,7 +336,7 @@ shift $(( OPTIND - 1 ))
 [[ "${CERT_AUTH:-}" ]] && cert_auth "$CERT_AUTH"
 [[ "${DNS:-}" ]] && dns
 [[ "${GROUPID:-}" =~ ^[0-9]+$ ]] && groupmod -g $GROUPID -o vpn
-[[ "${FIREWALL:-}" || -e $route6 || -e $route ]] && firewall "${FIREWALL:-}"
+[[ ! -z "${FIREWALL+x}" || -e $route6 || -e $route ]] &&firewall "${FIREWALL:-}"
 while read i; do
     return_route6 "$i"
 done < <(env | awk '/^ROUTE6[=_]/ {sub (/^[^=]*=/, "", $0); print}')
@@ -318,6 +353,8 @@ done < <(env | awk '/^ROUTE[=_]/ {sub (/^[^=]*=/, "", $0); print}')
 while read i; do
     eval vpnportforward $(sed 's/^/"/; s/$/"/; s/;/" "/g' <<< $i)
 done < <(env | awk '/^VPNPORT[0-9=_]/ {sub (/^[^=]*=/, "", $0); print}')
+
+global_return_routes
 
 [[ ${DEFAULT_GATEWAY:-} == "false" ]] &&
             ext_args=$(sed 's/ --redirect-gateway def1//' <<< $ext_args)
@@ -338,6 +375,6 @@ else
     [[ -e $cert ]] || grep -Eq '^ *(<ca>|ca +)' $conf ||
         { echo "ERROR: VPN CA cert missing!"; sleep 120; }
     set -x
-    exec sg vpn -c "openvpn --cd $dir --config $conf ${ext_args[*]} \
+    exec sg vpn -c "openvpn --cd $dir --config $conf $ext_args \
                ${OTHER_ARGS:-} ${MSS:+--fragment $MSS --mssfix}"
 fi
