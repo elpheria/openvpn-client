@@ -1,5 +1,5 @@
 image: elpheria/openvpn-client:latest
-tags: ['5c8b935']
+tags: ['8085035']
 manifests:
   - image: elpheria/openvpn-client:amd64
     platform:
